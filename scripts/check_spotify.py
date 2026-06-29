@@ -17,8 +17,9 @@ STATE_PATH = "data/state.json"
 DEBUG_DIR = "debug"
 SESSION_STATE_PATH = "spotify_storage_state.json"
 
-DEFAULT_CHART_SLUG = "regional-global-daily"
-DEFAULT_PUBLIC_CHART_URL = f"https://charts.spotify.com/charts/view/{DEFAULT_CHART_SLUG}/latest"
+TARGET_ALIAS = "REGIONAL_GLOBAL_DAILY"
+
+DEFAULT_PUBLIC_CHART_URL = "https://charts.spotify.com/charts/overview/global"
 
 PEAK_START_HOUR = 9
 PEAK_START_MINUTE = 45
@@ -70,12 +71,6 @@ def is_peak_window(dt: datetime | None = None) -> bool:
 
 
 def should_keep_looping_this_run(start_time: datetime) -> bool:
-    """
-    GitHub Actions runs every 5 minutes.
-
-    During the peak window, this script stays alive and checks every 60 seconds.
-    It stops before the next scheduled GitHub run should begin.
-    """
     if not is_peak_window():
         return False
 
@@ -83,19 +78,12 @@ def should_keep_looping_this_run(start_time: datetime) -> bool:
     return elapsed_seconds < 260
 
 
-def get_chart_slug() -> str:
-    return os.getenv("CHART_SLUG", DEFAULT_CHART_SLUG).strip()
-
-
 def get_public_chart_url() -> str:
-    return os.getenv(
-        "PUBLIC_CHART_URL",
-        f"https://charts.spotify.com/charts/view/{get_chart_slug()}/latest",
-    ).strip()
+    return os.getenv("PUBLIC_CHART_URL", DEFAULT_PUBLIC_CHART_URL).strip()
 
 
 def get_target_api_substring() -> str:
-    return f"/auth/v0/charts/{get_chart_slug()}/latest"
+    return "/auth/v1/overview/GLOBAL"
 
 
 def get_discord_webhook_url() -> str:
@@ -156,15 +144,6 @@ def save_debug(page, name: str) -> None:
 
 
 def write_storage_state_from_cookies() -> str:
-    """
-    Creates a Playwright browser session from Spotify cookies copied from your normal browser.
-
-    Required GitHub secret:
-    - SPOTIFY_SP_DC
-
-    Optional GitHub secret:
-    - SPOTIFY_SP_KEY
-    """
     sp_dc = os.getenv("SPOTIFY_SP_DC", "").strip()
     sp_key = os.getenv("SPOTIFY_SP_KEY", "").strip()
 
@@ -216,16 +195,12 @@ def write_storage_state_from_cookies() -> str:
     return SESSION_STATE_PATH
 
 
-def fetch_chart_json_with_browser() -> dict:
-    """
-    Opens Spotify Charts using saved Spotify cookies instead of trying to log in every time.
-    Then captures the internal Spotify chart API response.
-    """
+def fetch_overview_json_with_browser() -> dict:
     public_url = get_public_chart_url()
     target_substring = get_target_api_substring()
     storage_state_path = write_storage_state_from_cookies()
 
-    print(f"Public chart URL: {public_url}")
+    print(f"Public overview URL: {public_url}")
     print(f"Target API substring: {target_substring}")
 
     service_responses_seen = []
@@ -276,10 +251,10 @@ def fetch_chart_json_with_browser() -> dict:
             print(f"Captured response status: {captured_response.status}")
 
             if captured_response.status >= 400:
-                save_debug(page, "bad_chart_response")
+                save_debug(page, "bad_overview_response")
                 body_preview = captured_response.text()[:500]
                 raise RuntimeError(
-                    f"Captured API returned HTTP {captured_response.status}. Preview: {body_preview}"
+                    f"Captured overview API returned HTTP {captured_response.status}. Preview: {body_preview}"
                 )
 
             data = captured_response.json()
@@ -287,12 +262,12 @@ def fetch_chart_json_with_browser() -> dict:
             return data
 
         except PlaywrightTimeoutError:
-            save_debug(page, "no_chart_response")
+            save_debug(page, "no_overview_response")
             browser.close()
             raise RuntimeError(
-                "Could not capture chart API response. "
+                "Could not capture Spotify overview API response. "
                 "The Spotify cookie may be missing, expired, copied from the wrong browser profile, "
-                "or not enough by itself. "
+                "or Spotify may be blocking GitHub. "
                 f"Spotify service responses seen: {service_responses_seen[:10]}"
             )
 
@@ -302,7 +277,29 @@ def fetch_chart_json_with_browser() -> dict:
             raise
 
 
-def extract_chart_summary(data: dict) -> dict:
+def extract_target_chart_from_overview(data: dict) -> dict:
+    sections = data.get("sections", [])
+
+    if not isinstance(sections, list):
+        raise RuntimeError("Overview JSON did not contain a normal sections list.")
+
+    for section in sections:
+        charts = section.get("charts", [])
+        if not isinstance(charts, list):
+            continue
+
+        for chart in charts:
+            metadata = chart.get("chartMetadata", {})
+            alias = metadata.get("alias", "")
+
+            if alias == TARGET_ALIAS:
+                print(f"Found target chart alias: {TARGET_ALIAS}")
+                return chart
+
+    raise RuntimeError(f"Could not find target chart alias in overview JSON: {TARGET_ALIAS}")
+
+
+def extract_chart_summary(chart: dict) -> dict:
     summary = {
         "title": "Spotify chart",
         "chart_date": "",
@@ -312,53 +309,19 @@ def extract_chart_summary(data: dict) -> dict:
         "entry_count": "",
     }
 
-    chart = data.get("chart", {})
-    chart_metadata = data.get("chartMetadata") or chart.get("chartMetadata") or {}
+    chart_metadata = chart.get("chartMetadata") or {}
 
-    readable_title = (
-        data.get("readableTitle")
-        or chart_metadata.get("readableTitle")
-        or chart.get("readableTitle")
-    )
-
+    readable_title = chart_metadata.get("readableTitle")
     if readable_title:
         summary["title"] = readable_title
 
-    dimensions = (
-        data.get("dimensions")
-        or chart_metadata.get("dimensions")
-        or chart.get("dimensions")
-        or {}
-    )
-
-    latest_date = (
-        data.get("latestDate")
-        or dimensions.get("latestDate")
-        or data.get("date")
-        or chart.get("date")
-    )
+    dimensions = chart_metadata.get("dimensions") or {}
+    latest_date = dimensions.get("latestDate")
 
     if latest_date:
         summary["chart_date"] = str(latest_date)
 
-    entries = (
-        data.get("entries")
-        or data.get("chartEntries")
-        or data.get("items")
-        or chart.get("entries")
-        or chart.get("chartEntries")
-        or []
-    )
-
-    if isinstance(entries, list):
-        summary["entry_count"] = str(len(entries))
-
-    first_entry = None
-
-    if isinstance(entries, list) and entries:
-        first_entry = entries[0]
-    elif data.get("firstEntry"):
-        first_entry = data.get("firstEntry")
+    first_entry = chart.get("firstEntry")
 
     if isinstance(first_entry, dict):
         track_metadata = first_entry.get("trackMetadata") or {}
@@ -416,7 +379,7 @@ def send_discord_update(
         )
 
     detected_time = readable_eastern_time()
-    public_chart_url = get_public_chart_url()
+    public_chart_url = "https://charts.spotify.com/charts/view/regional-global-daily/latest"
 
     if first_run:
         title = "Spotify monitor initialized"
@@ -424,7 +387,7 @@ def send_discord_update(
         color = 0x808080
     else:
         title = "Spotify Charts updated"
-        description = "A change was detected in the monitored Spotify chart data."
+        description = "Daily Top Songs: Global changed on Spotify Charts."
         color = 0x1DB954
 
     fields = [
@@ -459,15 +422,6 @@ def send_discord_update(
             {
                 "name": "#1 streams",
                 "value": format_streams(summary["top_streams"]),
-                "inline": True,
-            }
-        )
-
-    if summary.get("entry_count"):
-        fields.append(
-            {
-                "name": "Entries found",
-                "value": summary["entry_count"],
                 "inline": True,
             }
         )
@@ -511,13 +465,14 @@ def send_discord_update(
 def check_once() -> bool:
     state = load_state()
 
-    data = fetch_chart_json_with_browser()
+    overview_data = fetch_overview_json_with_browser()
+    target_chart = extract_target_chart_from_overview(overview_data)
 
-    normalized = normalize_for_hash(data)
+    normalized = normalize_for_hash(target_chart)
     new_hash = sha256_text(normalized)
     old_hash = state.get("last_hash", "")
 
-    summary = extract_chart_summary(data)
+    summary = extract_chart_summary(target_chart)
 
     print(f"Old hash: {old_hash}")
     print(f"New hash: {new_hash}")
@@ -554,8 +509,6 @@ def check_once() -> bool:
 
     print("Change detected.")
 
-    # Send Discord before saving the new hash.
-    # If Discord fails, the next run retries instead of silently missing the alert.
     send_discord_update(
         old_hash=old_hash,
         new_hash=new_hash,
@@ -579,8 +532,8 @@ def check_once() -> bool:
 def main() -> int:
     print("Spotify Chart Monitor starting.")
     print(f"Eastern time: {readable_eastern_time()}")
-    print(f"Chart slug: {get_chart_slug()}")
-    print(f"Public chart URL: {get_public_chart_url()}")
+    print(f"Target alias: {TARGET_ALIAS}")
+    print(f"Overview URL: {get_public_chart_url()}")
     print(f"Target API substring: {get_target_api_substring()}")
     print(f"Peak window active: {is_peak_window()}")
 
