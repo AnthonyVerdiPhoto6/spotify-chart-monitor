@@ -36,16 +36,11 @@ jobs:
 
       - name: Run Spotify monitor
         env:
-          SPOTIFY_EMAIL: ${{ secrets.SPOTIFY_EMAIL }}
-          SPOTIFY_PASSWORD: ${{ secrets.SPOTIFY_PASSWORD }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           SPOTIFY_SP_DC: ${{ secrets.SPOTIFY_SP_DC }}
           SPOTIFY_SP_KEY: ${{ secrets.SPOTIFY_SP_KEY }}
-          PUBLIC_CHART_URL: "https://charts.spotify.com/charts/overview/global"
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
-          # Daily Top Songs Global:
-          CHART_SLUG: "regional-global-daily"
-          PUBLIC_CHART_URL: "https://charts.spotify.com/charts/view/regional-global-daily/latest"
+          PUBLIC_CHART_URL: "https://charts.spotify.com/charts/overview/global"
 
           NOTIFY_ON_FIRST_RUN: "false"
           DISCORD_PING_EVERYONE: "false"
