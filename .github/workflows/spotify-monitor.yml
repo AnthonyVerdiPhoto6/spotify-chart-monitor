@@ -31,30 +31,22 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
-
       - name: Run Spotify monitor
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
-          # For Daily Top Songs Global:
-          CHART_SLUG: "regional-global-daily"
+          CSV_URL: "https://spotifycharts.com/regional/global/daily/latest/download"
+
           PUBLIC_CHART_URL: "https://charts.spotify.com/charts/view/regional-global-daily/latest"
 
-          # Do not ping Discord on first initialization.
           NOTIFY_ON_FIRST_RUN: "false"
 
-          # Keep false unless you want error logs sent to Discord too.
-          ERROR_NOTIFICATIONS: "false"
-
-          # Keep false unless you want @everyone on chart updates.
           DISCORD_PING_EVERYONE: "false"
 
         run: python scripts/check_spotify.py
 
       - name: Commit updated state
-        if: always()
+        if: success()
         run: |
           git config user.name "spotify-chart-monitor"
           git config user.email "actions@github.com"
