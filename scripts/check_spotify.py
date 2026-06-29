@@ -4,22 +4,25 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 EASTERN = ZoneInfo("America/New_York")
 
 STATE_PATH = "data/state.json"
-DEBUG_DIR = "debug"
-SESSION_STATE_PATH = "spotify_storage_state.json"
 
 TARGET_ALIAS = "REGIONAL_GLOBAL_DAILY"
 
-DEFAULT_PUBLIC_CHART_URL = "https://charts.spotify.com/charts/overview/global"
+PUBLIC_CHART_URL = "https://charts.spotify.com/charts/view/regional-global-daily/latest"
+OVERVIEW_URL = "https://charts.spotify.com/charts/overview/global"
+CHARTS_API_URL = "https://charts-spotify-com-service.spotify.com/auth/v1/overview/GLOBAL"
+
+TOKEN_URLS = [
+    "https://open.spotify.com/get_access_token?reason=transport&productType=web_player",
+    "https://open.spotify.com/api/token?reason=transport&productType=web_player",
+]
 
 PEAK_START_HOUR = 9
 PEAK_START_MINUTE = 45
@@ -29,8 +32,8 @@ PEAK_END_MINUTE = 30
 CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
 
 REQUEST_TIMEOUT_SECONDS = 25
-PAGE_TIMEOUT_MS = 90000
-NETWORK_WAIT_MS = 70000
+REQUEST_RETRIES = 3
+REQUEST_RETRY_SLEEP_SECONDS = 5
 
 
 def now_utc() -> datetime:
@@ -78,12 +81,21 @@ def should_keep_looping_this_run(start_time: datetime) -> bool:
     return elapsed_seconds < 260
 
 
-def get_public_chart_url() -> str:
-    return os.getenv("PUBLIC_CHART_URL", DEFAULT_PUBLIC_CHART_URL).strip()
+def get_spotify_cookie_header() -> str:
+    sp_dc = os.getenv("SPOTIFY_SP_DC", "").strip()
+    sp_key = os.getenv("SPOTIFY_SP_KEY", "").strip()
 
+    if not sp_dc:
+        raise RuntimeError(
+            "Missing SPOTIFY_SP_DC. Add your Spotify sp_dc cookie as a GitHub Actions secret."
+        )
 
-def get_target_api_substring() -> str:
-    return "/auth/v1/overview/GLOBAL"
+    parts = [f"sp_dc={sp_dc}"]
+
+    if sp_key:
+        parts.append(f"sp_key={sp_key}")
+
+    return "; ".join(parts)
 
 
 def get_discord_webhook_url() -> str:
@@ -127,154 +139,111 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def save_debug(page, name: str) -> None:
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-
-    try:
-        page.screenshot(path=f"{DEBUG_DIR}/{name}.png", full_page=True)
-    except Exception as exc:
-        print(f"Could not save screenshot: {exc}")
-
-    try:
-        html = page.content()
-        with open(f"{DEBUG_DIR}/{name}.html", "w", encoding="utf-8") as f:
-            f.write(html)
-    except Exception as exc:
-        print(f"Could not save HTML: {exc}")
-
-
-def write_storage_state_from_cookies() -> str:
-    sp_dc = os.getenv("SPOTIFY_SP_DC", "").strip()
-    sp_key = os.getenv("SPOTIFY_SP_KEY", "").strip()
-
-    if not sp_dc:
-        raise RuntimeError(
-            "Missing SPOTIFY_SP_DC. Add your Spotify sp_dc cookie as a GitHub Actions repository secret."
-        )
-
-    expires = int(time.time()) + 60 * 60 * 24 * 365
-
-    cookies = [
-        {
-            "name": "sp_dc",
-            "value": sp_dc,
-            "domain": ".spotify.com",
-            "path": "/",
-            "expires": expires,
-            "httpOnly": True,
-            "secure": True,
-            "sameSite": "Lax",
-        }
-    ]
-
-    if sp_key:
-        cookies.append(
-            {
-                "name": "sp_key",
-                "value": sp_key,
-                "domain": ".spotify.com",
-                "path": "/",
-                "expires": expires,
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "Lax",
-            }
-        )
-
-    storage_state = {
-        "cookies": cookies,
-        "origins": [],
+def base_headers() -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
     }
 
-    Path(SESSION_STATE_PATH).write_text(
-        json.dumps(storage_state, indent=2),
-        encoding="utf-8",
-    )
 
-    print(f"Wrote storage state from Spotify cookies to {SESSION_STATE_PATH}")
-    return SESSION_STATE_PATH
+def fetch_spotify_access_token() -> str:
+    cookie_header = get_spotify_cookie_header()
+    headers = base_headers()
+    headers["Cookie"] = cookie_header
+    headers["Referer"] = "https://open.spotify.com/"
 
+    last_error = None
 
-def fetch_overview_json_with_browser() -> dict:
-    public_url = get_public_chart_url()
-    target_substring = get_target_api_substring()
-    storage_state_path = write_storage_state_from_cookies()
+    for token_url in TOKEN_URLS:
+        for attempt in range(1, REQUEST_RETRIES + 1):
+            try:
+                print(f"Fetching Spotify access token from: {token_url}")
+                print(f"Attempt {attempt}/{REQUEST_RETRIES}")
 
-    print(f"Public overview URL: {public_url}")
-    print(f"Target API substring: {target_substring}")
-
-    service_responses_seen = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-
-        context = browser.new_context(
-            storage_state=storage_state_path,
-            viewport={"width": 1365, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
-
-        page = context.new_page()
-        page.set_default_timeout(PAGE_TIMEOUT_MS)
-
-        def log_response(response):
-            if "charts-spotify-com-service.spotify.com" in response.url:
-                service_responses_seen.append(response.url)
-                print(f"Spotify service response: {response.status} {response.url}")
-
-        page.on("response", log_response)
-
-        def is_target_response(response) -> bool:
-            return (
-                "charts-spotify-com-service.spotify.com" in response.url
-                and target_substring in response.url
-                and response.request.method == "GET"
-            )
-
-        try:
-            with page.expect_response(is_target_response, timeout=NETWORK_WAIT_MS) as response_info:
-                page.goto(public_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-
-            captured_response = response_info.value
-
-            print(f"Captured response URL: {captured_response.url}")
-            print(f"Captured response status: {captured_response.status}")
-
-            if captured_response.status >= 400:
-                save_debug(page, "bad_overview_response")
-                body_preview = captured_response.text()[:500]
-                raise RuntimeError(
-                    f"Captured overview API returned HTTP {captured_response.status}. Preview: {body_preview}"
+                response = requests.get(
+                    token_url,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
                 )
 
-            data = captured_response.json()
-            browser.close()
-            return data
+                print(f"Token HTTP status: {response.status_code}")
 
-        except PlaywrightTimeoutError:
-            save_debug(page, "no_overview_response")
-            browser.close()
-            raise RuntimeError(
-                "Could not capture Spotify overview API response. "
-                "The Spotify cookie may be missing, expired, copied from the wrong browser profile, "
-                "or Spotify may be blocking GitHub. "
-                f"Spotify service responses seen: {service_responses_seen[:10]}"
+                if response.status_code >= 400:
+                    raise RuntimeError(f"Token endpoint returned HTTP {response.status_code}: {response.text[:300]}")
+
+                data = response.json()
+
+                token = (
+                    data.get("accessToken")
+                    or data.get("access_token")
+                    or data.get("token")
+                )
+
+                if not token:
+                    raise RuntimeError(f"No access token found in token response. Keys: {list(data.keys())}")
+
+                print("Successfully got Spotify access token.")
+                return token
+
+            except Exception as exc:
+                last_error = exc
+                print(f"Token request failed: {exc}")
+
+                if attempt < REQUEST_RETRIES:
+                    time.sleep(REQUEST_RETRY_SLEEP_SECONDS)
+
+    raise RuntimeError(f"Could not get Spotify access token. Last error: {last_error}")
+
+
+def fetch_overview_json() -> dict:
+    token = fetch_spotify_access_token()
+    cookie_header = get_spotify_cookie_header()
+
+    headers = base_headers()
+    headers.update(
+        {
+            "Authorization": f"Bearer {token}",
+            "Cookie": cookie_header,
+            "Origin": "https://charts.spotify.com",
+            "Referer": OVERVIEW_URL,
+            "App-Platform": "WebPlayer",
+        }
+    )
+
+    last_error = None
+
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            print(f"Fetching Spotify Charts overview API. Attempt {attempt}/{REQUEST_RETRIES}")
+            print(f"API URL: {CHARTS_API_URL}")
+
+            response = requests.get(
+                CHARTS_API_URL,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
-        except Exception:
-            save_debug(page, "failure")
-            browser.close()
-            raise
+            print(f"Charts API HTTP status: {response.status_code}")
+
+            if response.status_code >= 400:
+                raise RuntimeError(f"Charts API returned HTTP {response.status_code}: {response.text[:500]}")
+
+            data = response.json()
+            print("Successfully fetched overview JSON.")
+            return data
+
+        except Exception as exc:
+            last_error = exc
+            print(f"Overview request failed: {exc}")
+
+            if attempt < REQUEST_RETRIES:
+                time.sleep(REQUEST_RETRY_SLEEP_SECONDS)
+
+    raise RuntimeError(f"Could not fetch Spotify overview JSON. Last error: {last_error}")
 
 
 def extract_target_chart_from_overview(data: dict) -> dict:
@@ -301,12 +270,11 @@ def extract_target_chart_from_overview(data: dict) -> dict:
 
 def extract_chart_summary(chart: dict) -> dict:
     summary = {
-        "title": "Spotify chart",
+        "title": "Daily Top Songs: Global",
         "chart_date": "",
         "top_entry": "",
         "top_artist": "",
         "top_streams": "",
-        "entry_count": "",
     }
 
     chart_metadata = chart.get("chartMetadata") or {}
@@ -325,11 +293,9 @@ def extract_chart_summary(chart: dict) -> dict:
 
     if isinstance(first_entry, dict):
         track_metadata = first_entry.get("trackMetadata") or {}
-        artist_metadata = first_entry.get("artistMetadata") or {}
         chart_entry_data = first_entry.get("chartEntryData") or {}
 
         track_name = track_metadata.get("trackName")
-        artist_name = artist_metadata.get("artistName")
 
         artists = track_metadata.get("artists") or []
         artist_names = []
@@ -341,11 +307,9 @@ def extract_chart_summary(chart: dict) -> dict:
 
         if track_name and artist_names:
             summary["top_entry"] = f"{track_name} by {', '.join(artist_names)}"
+            summary["top_artist"] = ", ".join(artist_names)
         elif track_name:
             summary["top_entry"] = track_name
-        elif artist_name:
-            summary["top_entry"] = artist_name
-            summary["top_artist"] = artist_name
 
         ranking_metric = chart_entry_data.get("rankingMetric") or {}
         if ranking_metric.get("value"):
@@ -378,9 +342,6 @@ def send_discord_update(
             "Not saving changed hash because no Discord alert can be sent."
         )
 
-    detected_time = readable_eastern_time()
-    public_chart_url = "https://charts.spotify.com/charts/view/regional-global-daily/latest"
-
     if first_run:
         title = "Spotify monitor initialized"
         description = "The first chart snapshot has been saved. Future changes will trigger alerts."
@@ -393,7 +354,7 @@ def send_discord_update(
     fields = [
         {
             "name": "Detected",
-            "value": detected_time,
+            "value": readable_eastern_time(),
             "inline": False,
         },
         {
@@ -440,7 +401,7 @@ def send_discord_update(
             {
                 "title": title,
                 "description": description,
-                "url": public_chart_url,
+                "url": PUBLIC_CHART_URL,
                 "color": color,
                 "fields": fields,
                 "footer": {
@@ -465,7 +426,7 @@ def send_discord_update(
 def check_once() -> bool:
     state = load_state()
 
-    overview_data = fetch_overview_json_with_browser()
+    overview_data = fetch_overview_json()
     target_chart = extract_target_chart_from_overview(overview_data)
 
     normalized = normalize_for_hash(target_chart)
@@ -491,9 +452,7 @@ def check_once() -> bool:
 
         save_state(state)
 
-        notify_first_run = os.getenv("NOTIFY_ON_FIRST_RUN", "false").lower() == "true"
-
-        if notify_first_run:
+        if os.getenv("NOTIFY_ON_FIRST_RUN", "false").lower() == "true":
             send_discord_update(
                 old_hash="",
                 new_hash=new_hash,
@@ -533,8 +492,7 @@ def main() -> int:
     print("Spotify Chart Monitor starting.")
     print(f"Eastern time: {readable_eastern_time()}")
     print(f"Target alias: {TARGET_ALIAS}")
-    print(f"Overview URL: {get_public_chart_url()}")
-    print(f"Target API substring: {get_target_api_substring()}")
+    print(f"Charts API URL: {CHARTS_API_URL}")
     print(f"Peak window active: {is_peak_window()}")
 
     start_time = now_utc()
