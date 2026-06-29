@@ -198,7 +198,6 @@ def login_to_spotify(page) -> None:
         timeout=PAGE_TIMEOUT_MS,
     )
 
-    # Cookie/consent buttons sometimes appear.
     click_if_visible(page, "button:has-text('Accept Cookies')")
     click_if_visible(page, "button:has-text('Accept')")
     click_if_visible(page, "button:has-text('Continue without Accepting')")
@@ -218,74 +217,118 @@ def login_to_spotify(page) -> None:
         "Spotify email",
     )
 
-    # Spotify sometimes uses a two-step flow:
-    # Step 1: enter email
-    # Step 2: click Continue
-    # Step 3: password field appears
-    print("Checking whether Spotify requires Continue after email.")
+    print("Clicking Continue after email.")
 
-    clicked_continue = False
+    click_first_working_selector(
+        page,
+        [
+            "button:has-text('Continue')",
+            "button:has-text('Next')",
+            "button[type='submit']",
+            "button[data-testid='login-button']",
+        ],
+        "email Continue button",
+    )
 
-    continue_selectors = [
-        "button:has-text('Continue')",
-        "button:has-text('Next')",
-        "button[data-testid='login-button']",
-        "button[type='submit']",
+    page.wait_for_timeout(5000)
+
+    print(f"URL after email Continue: {page.url}")
+
+    print("Clicking 'Log in with a password'.")
+
+    password_link_clicked = False
+
+    password_link_selectors = [
+        "button:has-text('Log in with a password')",
+        "a:has-text('Log in with a password')",
+        "text=Log in with a password",
+        "button:has-text('Log in with password')",
+        "a:has-text('Log in with password')",
+        "text=Log in with password",
     ]
 
-    for selector in continue_selectors:
+    for selector in password_link_selectors:
         try:
             locator = page.locator(selector).first
-            if locator.is_visible(timeout=3000):
-                locator.click()
-                print(f"Clicked email Continue/Next using selector: {selector}")
-                clicked_continue = True
-                break
+            locator.wait_for(state="visible", timeout=10000)
+            locator.click()
+            print(f"Clicked password-login link using selector: {selector}")
+            password_link_clicked = True
+            break
         except Exception:
             pass
 
-    if clicked_continue:
-        page.wait_for_timeout(3000)
+    if not password_link_clicked:
+        save_debug(page, "no_password_login_link")
+        raise RuntimeError(
+            "Could not click 'Log in with a password'. "
+            "Check debug/no_password_login_link.png."
+        )
+
+    page.wait_for_timeout(4000)
 
     print("Filling Spotify password.")
 
-    fill_first_working_selector(
-        page,
-        [
+    password_filled = False
+    last_error = None
+
+    # Try label-based fill first because Spotify's exact selectors can change.
+    try:
+        page.get_by_label("Password").fill(password, timeout=10000)
+        print("Filled Spotify password using label: Password")
+        password_filled = True
+    except Exception as exc:
+        last_error = exc
+
+    if not password_filled:
+        password_selectors = [
             "input#login-password",
             "input[data-testid='login-password']",
             "input[name='password']",
             "input[type='password']",
-        ],
-        password,
-        "Spotify password",
-    )
+            "input[autocomplete='current-password']",
+            "input[aria-label='Password']",
+            "input[aria-label*='Password']",
+        ]
+
+        for selector in password_selectors:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=10000)
+                locator.fill(password)
+                print(f"Filled Spotify password using selector: {selector}")
+                password_filled = True
+                break
+            except Exception as exc:
+                last_error = exc
+
+    if not password_filled:
+        save_debug(page, "no_password_field")
+        raise RuntimeError(
+            "Could not fill Spotify password. "
+            "Check debug/no_password_field.png. "
+            f"Last error: {last_error}"
+        )
 
     print("Submitting Spotify login.")
 
     click_first_working_selector(
         page,
         [
+            "button:has-text('Log in')",
+            "button:has-text('Log In')",
             "button#login-button",
             "button[data-testid='login-button']",
             "button[type='submit']",
-            "button:has-text('Log In')",
-            "button:has-text('Log in')",
-            "button:has-text('Continue')",
         ],
         "Spotify login button",
     )
 
-    print("Waiting after login submit.")
+    page.wait_for_timeout(7000)
 
-    # Give Spotify time to redirect or show a logged-in state.
-    page.wait_for_timeout(5000)
+    print(f"URL after login submit: {page.url}")
 
-    current_url = page.url
-    print(f"URL after login submit: {current_url}")
-
-    # If still on accounts.spotify.com, try waiting longer.
-    if "accounts.spotify.com" in current_url:
+    if "accounts.spotify.com" in page.url:
         try:
             page.wait_for_url(
                 lambda url: "accounts.spotify.com" not in url,
@@ -295,9 +338,9 @@ def login_to_spotify(page) -> None:
         except PlaywrightTimeoutError:
             save_debug(page, "login_timeout")
             raise RuntimeError(
-                "Spotify login did not complete. This may mean wrong credentials, "
-                "captcha, email verification, 2FA/security check, or Spotify blocked GitHub's login attempt. "
-                "Check debug/login_timeout.png artifact."
+                "Spotify login did not complete. "
+                "This may be wrong credentials, captcha, email verification, or Spotify blocked GitHub. "
+                "Check debug/login_timeout.png."
             )
     else:
         print(f"Login appears complete. Current URL: {page.url}")
