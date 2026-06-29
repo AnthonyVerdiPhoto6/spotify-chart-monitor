@@ -41,6 +41,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           SPOTIFY_SP_DC: ${{ secrets.SPOTIFY_SP_DC }}
           SPOTIFY_SP_KEY: ${{ secrets.SPOTIFY_SP_KEY }}
+          PUBLIC_CHART_URL: "https://charts.spotify.com/charts/overview/global"
 
           # Daily Top Songs Global:
           CHART_SLUG: "regional-global-daily"
