@@ -7,15 +7,16 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 EASTERN = ZoneInfo("America/New_York")
 
 STATE_PATH = "data/state.json"
 
-DEFAULT_MONITOR_URL = "https://charts-spotify-com-service.spotify.com/auth/v0/charts/regional-global-daily/latest"
+DEFAULT_CHART_SLUG = "regional-global-daily"
 
-DEFAULT_PUBLIC_CHART_URL = "https://charts.spotify.com/charts/view/regional-global-daily/latest"
+DEFAULT_PUBLIC_CHART_URL = f"https://charts.spotify.com/charts/view/{DEFAULT_CHART_SLUG}/latest"
 
 PEAK_START_HOUR = 9
 PEAK_START_MINUTE = 45
@@ -25,8 +26,9 @@ PEAK_END_MINUTE = 30
 CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
 
 REQUEST_TIMEOUT_SECONDS = 20
-REQUEST_RETRIES = 3
-REQUEST_RETRY_SLEEP_SECONDS = 5
+
+PAGE_TIMEOUT_MS = 60000
+NETWORK_WAIT_MS = 45000
 
 
 def now_utc() -> datetime:
@@ -68,17 +70,43 @@ def is_peak_window(dt: datetime | None = None) -> bool:
 
 def should_keep_looping_this_run(start_time: datetime) -> bool:
     """
-    GitHub schedules us every 5 minutes.
+    GitHub Actions scheduled runs are every 5 minutes.
 
-    During peak window, this script stays alive and checks every 60 seconds.
-    We stop before the next 5-minute GitHub run should begin, so runs do not overlap.
+    During the peak window, this script stays alive and checks every 60 seconds.
+    We stop before the next scheduled GitHub run so jobs do not overlap.
     """
     if not is_peak_window():
         return False
 
     elapsed_seconds = (now_utc() - start_time).total_seconds()
-
     return elapsed_seconds < 260
+
+
+def get_chart_slug() -> str:
+    return os.getenv("CHART_SLUG", DEFAULT_CHART_SLUG).strip()
+
+
+def get_public_chart_url() -> str:
+    return os.getenv(
+        "PUBLIC_CHART_URL",
+        f"https://charts.spotify.com/charts/view/{get_chart_slug()}/latest",
+    ).strip()
+
+
+def get_target_api_substring() -> str:
+    """
+    The browser page calls a URL like:
+
+    https://charts-spotify-com-service.spotify.com/auth/v0/charts/regional-global-daily/latest
+
+    We do not call that URL directly because it returns 401 outside the browser.
+    Instead, Playwright opens the real page and captures that response.
+    """
+    return f"/auth/v0/charts/{get_chart_slug()}/latest"
+
+
+def get_discord_webhook_url() -> str:
+    return os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 
 def load_state() -> dict:
@@ -105,99 +133,7 @@ def save_state(state: dict) -> None:
         f.write("\n")
 
 
-def get_monitor_url() -> str:
-    return os.getenv("MONITOR_URL", DEFAULT_MONITOR_URL).strip()
-
-
-def get_public_chart_url() -> str:
-    return os.getenv("PUBLIC_CHART_URL", DEFAULT_PUBLIC_CHART_URL).strip()
-
-
-def get_discord_webhook_url() -> str:
-    return os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
-
-def get_optional_bearer_token() -> str:
-    """
-    You probably will not need this.
-
-    But if Spotify blocks the endpoint with 401/403, this allows you to add
-    a temporary bearer token as a GitHub secret named SPOTIFY_BEARER_TOKEN.
-    """
-    return os.getenv("SPOTIFY_BEARER_TOKEN", "").strip()
-
-
-def build_headers() -> dict:
-    headers = {
-        "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "spotify-chart-monitor/1.0",
-        "Origin": "https://charts.spotify.com",
-        "Referer": get_public_chart_url(),
-    }
-
-    bearer = get_optional_bearer_token()
-    if bearer:
-        if bearer.lower().startswith("bearer "):
-            headers["Authorization"] = bearer
-        else:
-            headers["Authorization"] = f"Bearer {bearer}"
-
-    return headers
-
-
-def fetch_json() -> dict:
-    url = get_monitor_url()
-    headers = build_headers()
-
-    last_error = None
-
-    for attempt in range(1, REQUEST_RETRIES + 1):
-        try:
-            print(f"Fetching Spotify data. Attempt {attempt}/{REQUEST_RETRIES}")
-            print(f"URL: {url}")
-
-            response = requests.get(
-                url,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-
-            print(f"HTTP status: {response.status_code}")
-
-            if response.status_code in (401, 403):
-                raise RuntimeError(
-                    f"Spotify returned {response.status_code}. "
-                    "This endpoint may require an auth token. "
-                    "If this happens in GitHub Actions, we may need the browser-based version instead."
-                )
-
-            response.raise_for_status()
-
-            try:
-                return response.json()
-            except json.JSONDecodeError as exc:
-                preview = response.text[:500]
-                raise RuntimeError(
-                    f"Spotify did not return valid JSON. Response preview: {preview}"
-                ) from exc
-
-        except Exception as exc:
-            last_error = exc
-            print(f"Request failed: {exc}")
-
-            if attempt < REQUEST_RETRIES:
-                print(f"Sleeping {REQUEST_RETRY_SLEEP_SECONDS} seconds before retry.")
-                time.sleep(REQUEST_RETRY_SLEEP_SECONDS)
-
-    raise RuntimeError(f"Failed to fetch Spotify JSON after retries: {last_error}")
-
-
 def normalize_for_hash(data: dict) -> str:
-    """
-    Makes the JSON stable before hashing.
-
-    Sorting keys prevents random key order from causing false change alerts.
-    """
     return json.dumps(
         data,
         sort_keys=True,
@@ -210,12 +146,109 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def extract_chart_summary(data: dict) -> dict:
+def fetch_chart_json_with_browser() -> dict:
     """
-    Tries to pull useful fields from Spotify's chart response.
+    Opens the actual Spotify Charts page in a headless browser and captures the
+    chart API response that the page itself requests.
 
-    This is intentionally defensive because Spotify can change field names.
+    This avoids the 401 issue from direct requests.
     """
+    public_url = get_public_chart_url()
+    target_substring = get_target_api_substring()
+
+    print(f"Opening page: {public_url}")
+    print(f"Waiting for API response containing: {target_substring}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        context = browser.new_context(
+            viewport={"width": 1365, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+
+        page = context.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT_MS)
+
+        captured_response = None
+
+        def is_target_response(response) -> bool:
+            url = response.url
+            return (
+                "charts-spotify-com-service.spotify.com" in url
+                and target_substring in url
+                and response.request.method == "GET"
+            )
+
+        try:
+            with page.expect_response(is_target_response, timeout=NETWORK_WAIT_MS) as response_info:
+                page.goto(public_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+
+            captured_response = response_info.value
+
+        except PlaywrightTimeoutError:
+            print("Did not catch the target API response during initial page load.")
+            print("Trying to wait briefly after page load...")
+
+            page.wait_for_timeout(8000)
+
+            responses_seen = []
+
+            def log_response(response):
+                if "charts-spotify-com-service.spotify.com" in response.url:
+                    responses_seen.append(response.url)
+
+            page.on("response", log_response)
+
+            page.reload(wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            page.wait_for_timeout(10000)
+
+            browser.close()
+
+            raise RuntimeError(
+                "Could not find the Spotify chart API response. "
+                f"Expected URL to contain: {target_substring}. "
+                f"Spotify service responses seen: {responses_seen[:10]}"
+            )
+
+        status = captured_response.status
+        response_url = captured_response.url
+
+        print(f"Captured response URL: {response_url}")
+        print(f"Captured response status: {status}")
+
+        if status >= 400:
+            body_preview = captured_response.text()[:500]
+            browser.close()
+            raise RuntimeError(
+                f"Captured Spotify API response returned HTTP {status}. "
+                f"Preview: {body_preview}"
+            )
+
+        try:
+            data = captured_response.json()
+        except Exception as exc:
+            body_preview = captured_response.text()[:500]
+            browser.close()
+            raise RuntimeError(
+                f"Captured response was not valid JSON. Preview: {body_preview}"
+            ) from exc
+
+        browser.close()
+        return data
+
+
+def extract_chart_summary(data: dict) -> dict:
     summary = {
         "title": "Spotify chart",
         "chart_date": "",
@@ -314,12 +347,7 @@ def format_streams(value: str) -> str:
         return value
 
 
-def send_discord_update(
-    old_hash: str,
-    new_hash: str,
-    summary: dict,
-    first_run: bool = False,
-) -> None:
+def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: bool = False) -> None:
     webhook_url = get_discord_webhook_url()
 
     if not webhook_url:
@@ -420,12 +448,6 @@ def send_discord_update(
 
 
 def send_discord_error(error_message: str) -> None:
-    """
-    Optional error alerts.
-
-    By default, errors only appear in GitHub logs.
-    If you want Discord errors too, set ERROR_NOTIFICATIONS=true in the workflow env.
-    """
     if os.getenv("ERROR_NOTIFICATIONS", "false").lower() != "true":
         return
 
@@ -455,12 +477,10 @@ def send_discord_error(error_message: str) -> None:
 
 
 def check_once() -> bool:
-    """
-    Returns True if state changed.
-    """
     state = load_state()
 
-    data = fetch_json()
+    data = fetch_chart_json_with_browser()
+
     normalized = normalize_for_hash(data)
     new_hash = sha256_text(normalized)
     old_hash = state.get("last_hash", "")
@@ -526,6 +546,9 @@ def check_once() -> bool:
 def main() -> int:
     print("Spotify Chart Monitor starting.")
     print(f"Eastern time: {readable_eastern_time()}")
+    print(f"Chart slug: {get_chart_slug()}")
+    print(f"Public chart URL: {get_public_chart_url()}")
+    print(f"Target API substring: {get_target_api_substring()}")
     print(f"Peak window active: {is_peak_window()}")
 
     start_time = now_utc()
