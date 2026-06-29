@@ -230,55 +230,104 @@ def login_to_spotify(page) -> None:
         "email Continue button",
     )
 
-    page.wait_for_timeout(5000)
+    page.wait_for_timeout(6000)
 
     print(f"URL after email Continue: {page.url}")
-
-    print("Clicking 'Log in with a password'.")
+    print("Trying to click 'Log in with a password'.")
 
     password_link_clicked = False
 
-    password_link_selectors = [
-        "button:has-text('Log in with a password')",
-        "a:has-text('Log in with a password')",
-        "text=Log in with a password",
-        "button:has-text('Log in with password')",
-        "a:has-text('Log in with password')",
-        "text=Log in with password",
-    ]
+    # First try Playwright text matching.
+    try:
+        page.get_by_text("Log in with a password", exact=True).wait_for(
+            state="visible",
+            timeout=15000,
+        )
+        page.get_by_text("Log in with a password", exact=True).click(timeout=10000)
+        print("Clicked password-login link using get_by_text exact.")
+        password_link_clicked = True
+    except Exception as exc:
+        print(f"Exact text click failed: {exc}")
 
-    for selector in password_link_selectors:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="visible", timeout=10000)
-            locator.click()
-            print(f"Clicked password-login link using selector: {selector}")
+    # Try looser CSS/text selectors.
+    if not password_link_clicked:
+        password_link_selectors = [
+            "button:has-text('Log in with a password')",
+            "a:has-text('Log in with a password')",
+            "div:has-text('Log in with a password')",
+            "span:has-text('Log in with a password')",
+            "text=Log in with a password",
+        ]
+
+        for selector in password_link_selectors:
+            try:
+                locator = page.locator(selector).first
+                locator.wait_for(state="visible", timeout=7000)
+                locator.scroll_into_view_if_needed(timeout=5000)
+                locator.click(timeout=5000, force=True)
+                print(f"Clicked password-login link using selector: {selector}")
+                password_link_clicked = True
+                break
+            except Exception as exc:
+                print(f"Password link selector failed: {selector} | {exc}")
+
+    # Last-resort JavaScript click: scan all visible text and click closest button/link.
+    if not password_link_clicked:
+        print("Trying JavaScript text scan for password-login link.")
+
+        result = page.evaluate(
+            """
+            () => {
+                const wanted = "log in with a password";
+                const elements = Array.from(document.querySelectorAll("button, a, div, span, p"));
+
+                for (const el of elements) {
+                    const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+
+                    if (text.includes(wanted)) {
+                        const clickable = el.closest("button, a") || el;
+                        clickable.scrollIntoView({ block: "center", inline: "center" });
+                        clickable.click();
+                        return { clicked: true, text: text, tag: clickable.tagName };
+                    }
+                }
+
+                return {
+                    clicked: false,
+                    bodyText: (document.body.innerText || "").slice(0, 1500)
+                };
+            }
+            """
+        )
+
+        print(f"JavaScript click result: {result}")
+
+        if isinstance(result, dict) and result.get("clicked"):
             password_link_clicked = True
-            break
-        except Exception:
-            pass
 
     if not password_link_clicked:
         save_debug(page, "no_password_login_link")
         raise RuntimeError(
             "Could not click 'Log in with a password'. "
+            "The page text did not match what the script expected. "
             "Check debug/no_password_login_link.png."
         )
 
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(5000)
 
     print("Filling Spotify password.")
 
     password_filled = False
     last_error = None
 
-    # Try label-based fill first because Spotify's exact selectors can change.
     try:
+        page.get_by_label("Password").wait_for(state="visible", timeout=15000)
         page.get_by_label("Password").fill(password, timeout=10000)
         print("Filled Spotify password using label: Password")
         password_filled = True
     except Exception as exc:
         last_error = exc
+        print(f"Password label fill failed: {exc}")
 
     if not password_filled:
         password_selectors = [
@@ -294,13 +343,14 @@ def login_to_spotify(page) -> None:
         for selector in password_selectors:
             try:
                 locator = page.locator(selector).first
-                locator.wait_for(state="visible", timeout=10000)
+                locator.wait_for(state="visible", timeout=15000)
                 locator.fill(password)
                 print(f"Filled Spotify password using selector: {selector}")
                 password_filled = True
                 break
             except Exception as exc:
                 last_error = exc
+                print(f"Password selector failed: {selector} | {exc}")
 
     if not password_filled:
         save_debug(page, "no_password_field")
@@ -324,7 +374,7 @@ def login_to_spotify(page) -> None:
         "Spotify login button",
     )
 
-    page.wait_for_timeout(7000)
+    page.wait_for_timeout(8000)
 
     print(f"URL after login submit: {page.url}")
 
