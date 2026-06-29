@@ -33,8 +33,6 @@ jobs:
 
       - name: Run Spotify monitor
         env:
-          SPOTIFY_SP_DC: ${{ secrets.SPOTIFY_SP_DC }}
-          SPOTIFY_SP_KEY: ${{ secrets.SPOTIFY_SP_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
           NOTIFY_ON_FIRST_RUN: "false"
