@@ -16,10 +16,17 @@ STATE_PATH = "data/state.json"
 MONITOR_URL = "https://kworb.net/spotify/country/global_daily.html"
 PUBLIC_CHART_URL = "https://charts.spotify.com/charts/view/regional-global-daily/latest"
 
+ACTIVE_START_HOUR = 9
+ACTIVE_START_MINUTE = 0
+ACTIVE_END_HOUR = 16
+ACTIVE_END_MINUTE = 0
+
 PEAK_START_HOUR = 9
 PEAK_START_MINUTE = 45
 PEAK_END_HOUR = 10
 PEAK_END_MINUTE = 30
+
+CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
 
 CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
 
@@ -42,6 +49,31 @@ def iso_utc() -> str:
 
 def readable_eastern_time() -> str:
     return now_eastern().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
+def is_active_window(dt: datetime | None = None) -> bool:
+    """
+    Active monitoring window: 9:00 AM to 4:00 PM Eastern.
+
+    Uses < end time, so monitoring stops after the 3:55 PM run.
+    """
+    if dt is None:
+        dt = now_eastern()
+
+    start = dt.replace(
+        hour=ACTIVE_START_HOUR,
+        minute=ACTIVE_START_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+    end = dt.replace(
+        hour=ACTIVE_END_HOUR,
+        minute=ACTIVE_END_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+    return start <= dt < end
 
 
 def is_peak_window(dt: datetime | None = None) -> bool:
@@ -299,14 +331,19 @@ def main() -> int:
     print("Spotify/Kworb Chart Monitor starting.")
     print(f"Eastern time: {readable_eastern_time()}")
     print(f"Monitor URL: {MONITOR_URL}")
-    print(f"Peak window active: {is_peak_window()}")
+    print(f"Active window: {is_active_window()}")
+print(f"Peak window active: {is_peak_window()}")
 
-    start_time = now_utc()
+start_time = now_utc()
 
-    try:
-        if not is_peak_window():
-            check_once()
-            return 0
+try:
+    if not is_active_window():
+        print("Outside active monitoring window. No check will run.")
+        return 0
+
+    if not is_peak_window():
+        check_once()
+        return 0
 
         print("Peak window is active. Checking every 60 seconds during this workflow run.")
 
