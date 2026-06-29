@@ -28,8 +28,6 @@ PEAK_END_MINUTE = 30
 
 CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
 
-CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
-
 REQUEST_TIMEOUT_SECONDS = 25
 REQUEST_RETRIES = 3
 REQUEST_RETRY_SLEEP_SECONDS = 5
@@ -332,18 +330,18 @@ def main() -> int:
     print(f"Eastern time: {readable_eastern_time()}")
     print(f"Monitor URL: {MONITOR_URL}")
     print(f"Active window: {is_active_window()}")
-print(f"Peak window active: {is_peak_window()}")
+    print(f"Peak window active: {is_peak_window()}")
 
-start_time = now_utc()
+    start_time = now_utc()
 
-try:
-    if not is_active_window():
-        print("Outside active monitoring window. No check will run.")
-        return 0
+    try:
+        if not is_active_window():
+            print("Outside active monitoring window. No check will run.")
+            return 0
 
-    if not is_peak_window():
-        check_once()
-        return 0
+        if not is_peak_window():
+            check_once()
+            return 0
 
         print("Peak window is active. Checking every 60 seconds during this workflow run.")
 
