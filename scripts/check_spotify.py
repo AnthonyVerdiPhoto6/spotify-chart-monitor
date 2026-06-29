@@ -192,12 +192,18 @@ def login_to_spotify(page) -> None:
         )
 
     print("Opening Spotify login page.")
-    page.goto("https://accounts.spotify.com/en/login", wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+    page.goto(
+        "https://accounts.spotify.com/en/login",
+        wait_until="domcontentloaded",
+        timeout=PAGE_TIMEOUT_MS,
+    )
 
     # Cookie/consent buttons sometimes appear.
     click_if_visible(page, "button:has-text('Accept Cookies')")
     click_if_visible(page, "button:has-text('Accept')")
     click_if_visible(page, "button:has-text('Continue without Accepting')")
+
+    print("Filling Spotify email.")
 
     fill_first_working_selector(
         page,
@@ -212,6 +218,37 @@ def login_to_spotify(page) -> None:
         "Spotify email",
     )
 
+    # Spotify sometimes uses a two-step flow:
+    # Step 1: enter email
+    # Step 2: click Continue
+    # Step 3: password field appears
+    print("Checking whether Spotify requires Continue after email.")
+
+    clicked_continue = False
+
+    continue_selectors = [
+        "button:has-text('Continue')",
+        "button:has-text('Next')",
+        "button[data-testid='login-button']",
+        "button[type='submit']",
+    ]
+
+    for selector in continue_selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.is_visible(timeout=3000):
+                locator.click()
+                print(f"Clicked email Continue/Next using selector: {selector}")
+                clicked_continue = True
+                break
+        except Exception:
+            pass
+
+    if clicked_continue:
+        page.wait_for_timeout(3000)
+
+    print("Filling Spotify password.")
+
     fill_first_working_selector(
         page,
         [
@@ -224,6 +261,8 @@ def login_to_spotify(page) -> None:
         "Spotify password",
     )
 
+    print("Submitting Spotify login.")
+
     click_first_working_selector(
         page,
         [
@@ -232,24 +271,36 @@ def login_to_spotify(page) -> None:
             "button[type='submit']",
             "button:has-text('Log In')",
             "button:has-text('Log in')",
+            "button:has-text('Continue')",
         ],
         "Spotify login button",
     )
 
     print("Waiting after login submit.")
 
-    try:
-        page.wait_for_url(lambda url: "accounts.spotify.com" not in url, timeout=PAGE_TIMEOUT_MS)
-        print(f"Login redirected to: {page.url}")
-    except PlaywrightTimeoutError:
-        # Sometimes Spotify stays on accounts.spotify.com but is actually logged in,
-        # or shows a challenge. Save debug output.
-        save_debug(page, "login_timeout")
-        raise RuntimeError(
-            "Spotify login did not complete. This may mean wrong credentials, captcha, "
-            "2FA/security check, or Spotify blocked GitHub's login attempt. "
-            "Check debug/login_timeout.png artifact."
-        )
+    # Give Spotify time to redirect or show a logged-in state.
+    page.wait_for_timeout(5000)
+
+    current_url = page.url
+    print(f"URL after login submit: {current_url}")
+
+    # If still on accounts.spotify.com, try waiting longer.
+    if "accounts.spotify.com" in current_url:
+        try:
+            page.wait_for_url(
+                lambda url: "accounts.spotify.com" not in url,
+                timeout=PAGE_TIMEOUT_MS,
+            )
+            print(f"Login redirected to: {page.url}")
+        except PlaywrightTimeoutError:
+            save_debug(page, "login_timeout")
+            raise RuntimeError(
+                "Spotify login did not complete. This may mean wrong credentials, "
+                "captcha, email verification, 2FA/security check, or Spotify blocked GitHub's login attempt. "
+                "Check debug/login_timeout.png artifact."
+            )
+    else:
+        print(f"Login appears complete. Current URL: {page.url}")
 
 
 def fetch_chart_json_with_logged_in_browser() -> dict:
