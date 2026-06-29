@@ -1,4 +1,6 @@
+import csv
 import hashlib
+import io
 import json
 import os
 import sys
@@ -7,16 +9,14 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 EASTERN = ZoneInfo("America/New_York")
 
 STATE_PATH = "data/state.json"
 
-DEFAULT_CHART_SLUG = "regional-global-daily"
-
-DEFAULT_PUBLIC_CHART_URL = f"https://charts.spotify.com/charts/view/{DEFAULT_CHART_SLUG}/latest"
+DEFAULT_CSV_URL = "https://spotifycharts.com/regional/global/daily/latest/download"
+DEFAULT_PUBLIC_CHART_URL = "https://charts.spotify.com/charts/view/regional-global-daily/latest"
 
 PEAK_START_HOUR = 9
 PEAK_START_MINUTE = 45
@@ -25,10 +25,9 @@ PEAK_END_MINUTE = 30
 
 CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
 
-REQUEST_TIMEOUT_SECONDS = 20
-
-PAGE_TIMEOUT_MS = 60000
-NETWORK_WAIT_MS = 45000
+REQUEST_TIMEOUT_SECONDS = 25
+REQUEST_RETRIES = 3
+REQUEST_RETRY_SLEEP_SECONDS = 5
 
 
 def now_utc() -> datetime:
@@ -70,10 +69,10 @@ def is_peak_window(dt: datetime | None = None) -> bool:
 
 def should_keep_looping_this_run(start_time: datetime) -> bool:
     """
-    GitHub Actions scheduled runs are every 5 minutes.
+    GitHub Actions runs every 5 minutes.
 
-    During the peak window, this script stays alive and checks every 60 seconds.
-    We stop before the next scheduled GitHub run so jobs do not overlap.
+    During peak window, we keep this one job alive and check every 60 seconds.
+    We stop before the next 5-minute job should start.
     """
     if not is_peak_window():
         return False
@@ -82,27 +81,12 @@ def should_keep_looping_this_run(start_time: datetime) -> bool:
     return elapsed_seconds < 260
 
 
-def get_chart_slug() -> str:
-    return os.getenv("CHART_SLUG", DEFAULT_CHART_SLUG).strip()
+def get_csv_url() -> str:
+    return os.getenv("CSV_URL", DEFAULT_CSV_URL).strip()
 
 
 def get_public_chart_url() -> str:
-    return os.getenv(
-        "PUBLIC_CHART_URL",
-        f"https://charts.spotify.com/charts/view/{get_chart_slug()}/latest",
-    ).strip()
-
-
-def get_target_api_substring() -> str:
-    """
-    The browser page calls a URL like:
-
-    https://charts-spotify-com-service.spotify.com/auth/v0/charts/regional-global-daily/latest
-
-    We do not call that URL directly because it returns 401 outside the browser.
-    Instead, Playwright opens the real page and captures that response.
-    """
-    return f"/auth/v0/charts/{get_chart_slug()}/latest"
+    return os.getenv("PUBLIC_CHART_URL", DEFAULT_PUBLIC_CHART_URL).strip()
 
 
 def get_discord_webhook_url() -> str:
@@ -133,206 +117,152 @@ def save_state(state: dict) -> None:
         f.write("\n")
 
 
-def normalize_for_hash(data: dict) -> str:
-    return json.dumps(
-        data,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+def fetch_csv() -> tuple[str, dict]:
+    url = get_csv_url()
 
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,text/plain,*/*",
+    }
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    last_error = None
 
-
-def fetch_chart_json_with_browser() -> dict:
-    """
-    Opens the actual Spotify Charts page in a headless browser and captures the
-    chart API response that the page itself requests.
-
-    This avoids the 401 issue from direct requests.
-    """
-    public_url = get_public_chart_url()
-    target_substring = get_target_api_substring()
-
-    print(f"Opening page: {public_url}")
-    print(f"Waiting for API response containing: {target_substring}")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-
-        context = browser.new_context(
-            viewport={"width": 1365, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
-
-        page = context.new_page()
-        page.set_default_timeout(PAGE_TIMEOUT_MS)
-
-        captured_response = None
-
-        def is_target_response(response) -> bool:
-            url = response.url
-            return (
-                "charts-spotify-com-service.spotify.com" in url
-                and target_substring in url
-                and response.request.method == "GET"
-            )
-
+    for attempt in range(1, REQUEST_RETRIES + 1):
         try:
-            with page.expect_response(is_target_response, timeout=NETWORK_WAIT_MS) as response_info:
-                page.goto(public_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            print(f"Fetching Spotify CSV. Attempt {attempt}/{REQUEST_RETRIES}")
+            print(f"CSV URL: {url}")
 
-            captured_response = response_info.value
-
-        except PlaywrightTimeoutError:
-            print("Did not catch the target API response during initial page load.")
-            print("Trying to wait briefly after page load...")
-
-            page.wait_for_timeout(8000)
-
-            responses_seen = []
-
-            def log_response(response):
-                if "charts-spotify-com-service.spotify.com" in response.url:
-                    responses_seen.append(response.url)
-
-            page.on("response", log_response)
-
-            page.reload(wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-            page.wait_for_timeout(10000)
-
-            browser.close()
-
-            raise RuntimeError(
-                "Could not find the Spotify chart API response. "
-                f"Expected URL to contain: {target_substring}. "
-                f"Spotify service responses seen: {responses_seen[:10]}"
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=True,
             )
 
-        status = captured_response.status
-        response_url = captured_response.url
+            print(f"HTTP status: {response.status_code}")
+            print(f"Final URL: {response.url}")
 
-        print(f"Captured response URL: {response_url}")
-        print(f"Captured response status: {status}")
+            response.raise_for_status()
 
-        if status >= 400:
-            body_preview = captured_response.text()[:500]
-            browser.close()
-            raise RuntimeError(
-                f"Captured Spotify API response returned HTTP {status}. "
-                f"Preview: {body_preview}"
-            )
+            text = response.text
 
-        try:
-            data = captured_response.json()
+            if not text.strip():
+                raise RuntimeError("Spotify returned an empty response.")
+
+            lowered = text.lower()
+            if "<html" in lowered[:500]:
+                raise RuntimeError(
+                    "Spotify returned HTML instead of CSV. "
+                    "This likely means the CSV endpoint is blocked or redirected."
+                )
+
+            metadata = {
+                "final_url": response.url,
+                "last_modified": response.headers.get("Last-Modified", ""),
+                "content_type": response.headers.get("Content-Type", ""),
+            }
+
+            return text, metadata
+
         except Exception as exc:
-            body_preview = captured_response.text()[:500]
-            browser.close()
-            raise RuntimeError(
-                f"Captured response was not valid JSON. Preview: {body_preview}"
-            ) from exc
+            last_error = exc
+            print(f"Request failed: {exc}")
 
-        browser.close()
-        return data
+            if attempt < REQUEST_RETRIES:
+                print(f"Sleeping {REQUEST_RETRY_SLEEP_SECONDS} seconds before retry.")
+                time.sleep(REQUEST_RETRY_SLEEP_SECONDS)
+
+    raise RuntimeError(f"Failed to fetch Spotify CSV after retries: {last_error}")
 
 
-def extract_chart_summary(data: dict) -> dict:
+def stable_hash(text: str) -> str:
+    """
+    Normalize line endings before hashing so Windows/Linux line endings do not matter.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def parse_csv_summary(csv_text: str, metadata: dict) -> dict:
     summary = {
-        "title": "Spotify chart",
+        "title": "Daily Top Songs: Global",
         "chart_date": "",
         "top_entry": "",
         "top_artist": "",
         "top_streams": "",
         "entry_count": "",
+        "final_url": metadata.get("final_url", ""),
+        "last_modified": metadata.get("last_modified", ""),
     }
 
-    chart = data.get("chart", {})
-    chart_metadata = data.get("chartMetadata") or chart.get("chartMetadata") or {}
+    cleaned = csv_text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-    readable_title = (
-        data.get("readableTitle")
-        or chart_metadata.get("readableTitle")
-        or chart.get("readableTitle")
-    )
+    # Spotify CSVs are usually:
+    # Position, Track Name, Artist, Streams, URL
+    # but sometimes have extra intro/comment lines.
+    lines = [line for line in cleaned.split("\n") if line.strip()]
 
-    if readable_title:
-        summary["title"] = readable_title
+    header_index = None
 
-    dimensions = (
-        data.get("dimensions")
-        or chart_metadata.get("dimensions")
-        or chart.get("dimensions")
-        or {}
-    )
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if "position" in lower and ("track name" in lower or "artist" in lower):
+            header_index = i
+            break
 
-    latest_date = (
-        data.get("latestDate")
-        or dimensions.get("latestDate")
-        or data.get("date")
-        or chart.get("date")
-    )
+    if header_index is None:
+        print("Could not find normal CSV header. Using raw hash only.")
+        return summary
 
-    if latest_date:
-        summary["chart_date"] = str(latest_date)
+    usable_csv = "\n".join(lines[header_index:])
+    reader = csv.DictReader(io.StringIO(usable_csv))
+    rows = list(reader)
 
-    entries = (
-        data.get("entries")
-        or data.get("chartEntries")
-        or data.get("items")
-        or chart.get("entries")
-        or chart.get("chartEntries")
-        or []
-    )
+    summary["entry_count"] = str(len(rows))
 
-    if isinstance(entries, list):
-        summary["entry_count"] = str(len(entries))
+    if rows:
+        first = rows[0]
 
-    first_entry = None
+        track = (
+            first.get("Track Name")
+            or first.get("track_name")
+            or first.get("Track")
+            or ""
+        )
 
-    if isinstance(entries, list) and entries:
-        first_entry = entries[0]
-    elif data.get("firstEntry"):
-        first_entry = data.get("firstEntry")
+        artist = (
+            first.get("Artist")
+            or first.get("Artists")
+            or first.get("artist")
+            or ""
+        )
 
-    if isinstance(first_entry, dict):
-        track_metadata = first_entry.get("trackMetadata") or {}
-        artist_metadata = first_entry.get("artistMetadata") or {}
-        chart_entry_data = first_entry.get("chartEntryData") or {}
+        streams = (
+            first.get("Streams")
+            or first.get("streams")
+            or ""
+        )
 
-        track_name = track_metadata.get("trackName")
-        artist_name = artist_metadata.get("artistName")
+        if track and artist:
+            summary["top_entry"] = f"{track} by {artist}"
+        elif track:
+            summary["top_entry"] = track
+        elif artist:
+            summary["top_entry"] = artist
 
-        artists = track_metadata.get("artists") or []
-        artist_names = []
+        summary["top_artist"] = artist
+        summary["top_streams"] = streams.replace(",", "")
 
-        if isinstance(artists, list):
-            for artist in artists:
-                if isinstance(artist, dict) and artist.get("name"):
-                    artist_names.append(artist["name"])
-
-        if track_name and artist_names:
-            summary["top_entry"] = f"{track_name} by {', '.join(artist_names)}"
-        elif track_name:
-            summary["top_entry"] = track_name
-        elif artist_name:
-            summary["top_entry"] = artist_name
-            summary["top_artist"] = artist_name
-
-        ranking_metric = chart_entry_data.get("rankingMetric") or {}
-        if ranking_metric.get("value"):
-            summary["top_streams"] = str(ranking_metric["value"])
+    # Date may not be in the CSV itself. Sometimes final_url changes from latest to a dated URL.
+    final_url = summary["final_url"]
+    if "/daily/" in final_url:
+        piece = final_url.split("/daily/", 1)[-1].split("/", 1)[0]
+        if piece and piece != "latest":
+            summary["chart_date"] = piece
 
     return summary
 
@@ -351,8 +281,10 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
     webhook_url = get_discord_webhook_url()
 
     if not webhook_url:
-        print("No DISCORD_WEBHOOK_URL set. Skipping Discord notification.")
-        return
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL is not set. "
+            "Not saving a changed hash because no Discord alert can be sent."
+        )
 
     detected_time = readable_eastern_time()
     public_chart_url = get_public_chart_url()
@@ -363,7 +295,7 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
         color = 0x808080
     else:
         title = "Spotify Charts updated"
-        description = "A change was detected in the monitored Spotify chart data."
+        description = "A change was detected in the monitored Spotify chart CSV."
         color = 0x1DB954
 
     fields = [
@@ -377,12 +309,16 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
             "value": summary.get("title") or "Unknown",
             "inline": True,
         },
-        {
-            "name": "Chart date",
-            "value": summary.get("chart_date") or "Unknown",
-            "inline": True,
-        },
     ]
+
+    if summary.get("chart_date"):
+        fields.append(
+            {
+                "name": "Chart date",
+                "value": summary["chart_date"],
+                "inline": True,
+            }
+        )
 
     if summary.get("top_entry"):
         fields.append(
@@ -408,6 +344,15 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
                 "name": "Entries found",
                 "value": summary["entry_count"],
                 "inline": True,
+            }
+        )
+
+    if summary.get("last_modified"):
+        fields.append(
+            {
+                "name": "Last-Modified header",
+                "value": summary["last_modified"],
+                "inline": False,
             }
         )
 
@@ -447,51 +392,18 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
         raise RuntimeError(f"Discord webhook failed: {response.status_code} {response.text}")
 
 
-def send_discord_error(error_message: str) -> None:
-    if os.getenv("ERROR_NOTIFICATIONS", "false").lower() != "true":
-        return
-
-    webhook_url = get_discord_webhook_url()
-
-    if not webhook_url:
-        return
-
-    payload = {
-        "embeds": [
-            {
-                "title": "Spotify monitor error",
-                "description": error_message[:3500],
-                "color": 0xFF0000,
-                "fields": [
-                    {
-                        "name": "Time",
-                        "value": readable_eastern_time(),
-                        "inline": False,
-                    }
-                ],
-            }
-        ]
-    }
-
-    requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-
-
 def check_once() -> bool:
     state = load_state()
 
-    data = fetch_chart_json_with_browser()
-
-    normalized = normalize_for_hash(data)
-    new_hash = sha256_text(normalized)
+    csv_text, metadata = fetch_csv()
+    new_hash = stable_hash(csv_text)
     old_hash = state.get("last_hash", "")
 
-    summary = extract_chart_summary(data)
+    summary = parse_csv_summary(csv_text, metadata)
 
     print(f"Old hash: {old_hash}")
     print(f"New hash: {new_hash}")
     print(f"Summary: {json.dumps(summary, indent=2)}")
-
-    state["last_checked_at"] = iso_utc()
 
     if not state.get("initialized"):
         print("First run. Initializing state.")
@@ -500,6 +412,7 @@ def check_once() -> bool:
         state["last_seen_chart_date"] = summary.get("chart_date", "")
         state["last_seen_title"] = summary.get("title", "")
         state["last_seen_top_entry"] = summary.get("top_entry", "")
+        state["last_checked_at"] = iso_utc()
         state["last_changed_at"] = iso_utc()
         state["initialized"] = True
 
@@ -519,20 +432,14 @@ def check_once() -> bool:
 
     if new_hash == old_hash:
         print("No change detected.")
-        save_state(state)
+        print("State file will not be updated, so no unnecessary commit will be created.")
         return True
 
     print("Change detected.")
 
-    state["last_hash"] = new_hash
-    state["last_seen_chart_date"] = summary.get("chart_date", "")
-    state["last_seen_title"] = summary.get("title", "")
-    state["last_seen_top_entry"] = summary.get("top_entry", "")
-    state["last_changed_at"] = iso_utc()
-    state["initialized"] = True
-
-    save_state(state)
-
+    # Important:
+    # Send Discord BEFORE saving new hash.
+    # If Discord fails, we do not save the new hash, so the next run will retry the alert.
     send_discord_update(
         old_hash=old_hash,
         new_hash=new_hash,
@@ -540,15 +447,24 @@ def check_once() -> bool:
         first_run=False,
     )
 
+    state["last_hash"] = new_hash
+    state["last_seen_chart_date"] = summary.get("chart_date", "")
+    state["last_seen_title"] = summary.get("title", "")
+    state["last_seen_top_entry"] = summary.get("top_entry", "")
+    state["last_checked_at"] = iso_utc()
+    state["last_changed_at"] = iso_utc()
+    state["initialized"] = True
+
+    save_state(state)
+
     return True
 
 
 def main() -> int:
     print("Spotify Chart Monitor starting.")
     print(f"Eastern time: {readable_eastern_time()}")
-    print(f"Chart slug: {get_chart_slug()}")
+    print(f"CSV URL: {get_csv_url()}")
     print(f"Public chart URL: {get_public_chart_url()}")
-    print(f"Target API substring: {get_target_api_substring()}")
     print(f"Peak window active: {is_peak_window()}")
 
     start_time = now_utc()
@@ -573,14 +489,7 @@ def main() -> int:
         return 0
 
     except Exception as exc:
-        error_message = str(exc)
-        print(f"ERROR: {error_message}", file=sys.stderr)
-
-        try:
-            send_discord_error(error_message)
-        except Exception as discord_exc:
-            print(f"Failed to send Discord error notification: {discord_exc}", file=sys.stderr)
-
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
 
