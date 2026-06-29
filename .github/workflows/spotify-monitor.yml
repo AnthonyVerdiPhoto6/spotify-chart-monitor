@@ -31,19 +31,31 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
       - name: Run Spotify monitor
         env:
+          SPOTIFY_EMAIL: ${{ secrets.SPOTIFY_EMAIL }}
+          SPOTIFY_PASSWORD: ${{ secrets.SPOTIFY_PASSWORD }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
-          CSV_URL: "https://spotifycharts.com/regional/global/daily/latest/download"
-
+          # Daily Top Songs Global:
+          CHART_SLUG: "regional-global-daily"
           PUBLIC_CHART_URL: "https://charts.spotify.com/charts/view/regional-global-daily/latest"
 
           NOTIFY_ON_FIRST_RUN: "false"
-
           DISCORD_PING_EVERYONE: "false"
 
         run: python scripts/check_spotify.py
+
+      - name: Upload debug artifacts if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spotify-debug
+          path: debug/
+          if-no-files-found: ignore
 
       - name: Commit updated state
         if: success()
