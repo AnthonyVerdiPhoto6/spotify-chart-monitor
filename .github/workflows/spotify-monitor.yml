@@ -1,0 +1,62 @@
+name: Spotify Chart Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spotify-chart-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Spotify monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+          MONITOR_URL: "https://charts-spotify-com-service.spotify.com/auth/v0/charts/regional-global-daily/latest"
+
+          PUBLIC_CHART_URL: "https://charts.spotify.com/charts/view/regional-global-daily/latest"
+
+          NOTIFY_ON_FIRST_RUN: "false"
+
+          ERROR_NOTIFICATIONS: "false"
+
+          DISCORD_PING_EVERYONE: "false"
+
+        run: python scripts/check_spotify.py
+
+      - name: Commit updated state
+        if: always()
+        run: |
+          git config user.name "spotify-chart-monitor"
+          git config user.email "actions@github.com"
+
+          if [[ -n "$(git status --porcelain data/state.json)" ]]; then
+            git add data/state.json
+            git commit -m "Update Spotify monitor state"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
