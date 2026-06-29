@@ -39,6 +39,8 @@ jobs:
           SPOTIFY_EMAIL: ${{ secrets.SPOTIFY_EMAIL }}
           SPOTIFY_PASSWORD: ${{ secrets.SPOTIFY_PASSWORD }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SPOTIFY_SP_DC: ${{ secrets.SPOTIFY_SP_DC }}
+          SPOTIFY_SP_KEY: ${{ secrets.SPOTIFY_SP_KEY }}
 
           # Daily Top Songs Global:
           CHART_SLUG: "regional-global-daily"
