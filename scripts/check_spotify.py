@@ -4,6 +4,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
@@ -14,6 +15,7 @@ EASTERN = ZoneInfo("America/New_York")
 
 STATE_PATH = "data/state.json"
 DEBUG_DIR = "debug"
+SESSION_STATE_PATH = "spotify_storage_state.json"
 
 DEFAULT_CHART_SLUG = "regional-global-daily"
 DEFAULT_PUBLIC_CHART_URL = f"https://charts.spotify.com/charts/view/{DEFAULT_CHART_SLUG}/latest"
@@ -50,13 +52,30 @@ def is_peak_window(dt: datetime | None = None) -> bool:
     if dt is None:
         dt = now_eastern()
 
-    start = dt.replace(hour=PEAK_START_HOUR, minute=PEAK_START_MINUTE, second=0, microsecond=0)
-    end = dt.replace(hour=PEAK_END_HOUR, minute=PEAK_END_MINUTE, second=0, microsecond=0)
+    start = dt.replace(
+        hour=PEAK_START_HOUR,
+        minute=PEAK_START_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+    end = dt.replace(
+        hour=PEAK_END_HOUR,
+        minute=PEAK_END_MINUTE,
+        second=0,
+        microsecond=0,
+    )
 
     return start <= dt <= end
 
 
 def should_keep_looping_this_run(start_time: datetime) -> bool:
+    """
+    GitHub Actions runs every 5 minutes.
+
+    During the peak window, this script stays alive and checks every 60 seconds.
+    It stops before the next scheduled GitHub run should begin.
+    """
     if not is_peak_window():
         return False
 
@@ -81,14 +100,6 @@ def get_target_api_substring() -> str:
 
 def get_discord_webhook_url() -> str:
     return os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
-
-def get_spotify_email() -> str:
-    return os.getenv("SPOTIFY_EMAIL", "").strip()
-
-
-def get_spotify_password() -> str:
-    return os.getenv("SPOTIFY_PASSWORD", "").strip()
 
 
 def load_state() -> dict:
@@ -116,7 +127,12 @@ def save_state(state: dict) -> None:
 
 
 def normalize_for_hash(data: dict) -> str:
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
 
 
 def sha256_text(text: str) -> str:
@@ -139,266 +155,75 @@ def save_debug(page, name: str) -> None:
         print(f"Could not save HTML: {exc}")
 
 
-def click_if_visible(page, selector: str, timeout: int = 3000) -> bool:
-    try:
-        locator = page.locator(selector).first
-        locator.wait_for(state="visible", timeout=timeout)
-        locator.click(timeout=timeout)
-        return True
-    except Exception:
-        return False
+def write_storage_state_from_cookies() -> str:
+    """
+    Creates a Playwright browser session from Spotify cookies copied from your normal browser.
 
+    Required GitHub secret:
+    - SPOTIFY_SP_DC
 
-def fill_first_working_selector(page, selectors: list[str], value: str, label: str) -> None:
-    last_error = None
+    Optional GitHub secret:
+    - SPOTIFY_SP_KEY
+    """
+    sp_dc = os.getenv("SPOTIFY_SP_DC", "").strip()
+    sp_key = os.getenv("SPOTIFY_SP_KEY", "").strip()
 
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="visible", timeout=10000)
-            locator.fill(value)
-            print(f"Filled {label} using selector: {selector}")
-            return
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f"Could not fill {label}. Last error: {last_error}")
-
-
-def click_first_working_selector(page, selectors: list[str], label: str) -> None:
-    last_error = None
-
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="visible", timeout=10000)
-            locator.click()
-            print(f"Clicked {label} using selector: {selector}")
-            return
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f"Could not click {label}. Last error: {last_error}")
-
-
-def login_to_spotify(page) -> None:
-    email = get_spotify_email()
-    password = get_spotify_password()
-
-    if not email or not password:
+    if not sp_dc:
         raise RuntimeError(
-            "Spotify login required but SPOTIFY_EMAIL or SPOTIFY_PASSWORD is missing. "
-            "Add both as GitHub Actions repository secrets."
+            "Missing SPOTIFY_SP_DC. Add your Spotify sp_dc cookie as a GitHub Actions repository secret."
         )
 
-    print("Opening Spotify login page.")
-    page.goto(
-        "https://accounts.spotify.com/en/login",
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT_MS,
-    )
+    expires = int(time.time()) + 60 * 60 * 24 * 365
 
-    click_if_visible(page, "button:has-text('Accept Cookies')")
-    click_if_visible(page, "button:has-text('Accept')")
-    click_if_visible(page, "button:has-text('Continue without Accepting')")
+    cookies = [
+        {
+            "name": "sp_dc",
+            "value": sp_dc,
+            "domain": ".spotify.com",
+            "path": "/",
+            "expires": expires,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Lax",
+        }
+    ]
 
-    print("Filling Spotify email.")
-
-    fill_first_working_selector(
-        page,
-        [
-            "input#login-username",
-            "input[data-testid='login-username']",
-            "input[name='username']",
-            "input[type='email']",
-            "input[type='text']",
-        ],
-        email,
-        "Spotify email",
-    )
-
-    print("Clicking Continue after email.")
-
-    click_first_working_selector(
-        page,
-        [
-            "button:has-text('Continue')",
-            "button:has-text('Next')",
-            "button[type='submit']",
-            "button[data-testid='login-button']",
-        ],
-        "email Continue button",
-    )
-
-    page.wait_for_timeout(6000)
-
-    print(f"URL after email Continue: {page.url}")
-    print("Trying to click 'Log in with a password'.")
-
-    password_link_clicked = False
-
-    # First try Playwright text matching.
-    try:
-        page.get_by_text("Log in with a password", exact=True).wait_for(
-            state="visible",
-            timeout=15000,
-        )
-        page.get_by_text("Log in with a password", exact=True).click(timeout=10000)
-        print("Clicked password-login link using get_by_text exact.")
-        password_link_clicked = True
-    except Exception as exc:
-        print(f"Exact text click failed: {exc}")
-
-    # Try looser CSS/text selectors.
-    if not password_link_clicked:
-        password_link_selectors = [
-            "button:has-text('Log in with a password')",
-            "a:has-text('Log in with a password')",
-            "div:has-text('Log in with a password')",
-            "span:has-text('Log in with a password')",
-            "text=Log in with a password",
-        ]
-
-        for selector in password_link_selectors:
-            try:
-                locator = page.locator(selector).first
-                locator.wait_for(state="visible", timeout=7000)
-                locator.scroll_into_view_if_needed(timeout=5000)
-                locator.click(timeout=5000, force=True)
-                print(f"Clicked password-login link using selector: {selector}")
-                password_link_clicked = True
-                break
-            except Exception as exc:
-                print(f"Password link selector failed: {selector} | {exc}")
-
-    # Last-resort JavaScript click: scan all visible text and click closest button/link.
-    if not password_link_clicked:
-        print("Trying JavaScript text scan for password-login link.")
-
-        result = page.evaluate(
-            """
-            () => {
-                const wanted = "log in with a password";
-                const elements = Array.from(document.querySelectorAll("button, a, div, span, p"));
-
-                for (const el of elements) {
-                    const text = (el.innerText || el.textContent || "").trim().toLowerCase();
-
-                    if (text.includes(wanted)) {
-                        const clickable = el.closest("button, a") || el;
-                        clickable.scrollIntoView({ block: "center", inline: "center" });
-                        clickable.click();
-                        return { clicked: true, text: text, tag: clickable.tagName };
-                    }
-                }
-
-                return {
-                    clicked: false,
-                    bodyText: (document.body.innerText || "").slice(0, 1500)
-                };
+    if sp_key:
+        cookies.append(
+            {
+                "name": "sp_key",
+                "value": sp_key,
+                "domain": ".spotify.com",
+                "path": "/",
+                "expires": expires,
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
             }
-            """
         )
 
-        print(f"JavaScript click result: {result}")
+    storage_state = {
+        "cookies": cookies,
+        "origins": [],
+    }
 
-        if isinstance(result, dict) and result.get("clicked"):
-            password_link_clicked = True
-
-    if not password_link_clicked:
-        save_debug(page, "no_password_login_link")
-        raise RuntimeError(
-            "Could not click 'Log in with a password'. "
-            "The page text did not match what the script expected. "
-            "Check debug/no_password_login_link.png."
-        )
-
-    page.wait_for_timeout(5000)
-
-    print("Filling Spotify password.")
-
-    password_filled = False
-    last_error = None
-
-    try:
-        page.get_by_label("Password").wait_for(state="visible", timeout=15000)
-        page.get_by_label("Password").fill(password, timeout=10000)
-        print("Filled Spotify password using label: Password")
-        password_filled = True
-    except Exception as exc:
-        last_error = exc
-        print(f"Password label fill failed: {exc}")
-
-    if not password_filled:
-        password_selectors = [
-            "input#login-password",
-            "input[data-testid='login-password']",
-            "input[name='password']",
-            "input[type='password']",
-            "input[autocomplete='current-password']",
-            "input[aria-label='Password']",
-            "input[aria-label*='Password']",
-        ]
-
-        for selector in password_selectors:
-            try:
-                locator = page.locator(selector).first
-                locator.wait_for(state="visible", timeout=15000)
-                locator.fill(password)
-                print(f"Filled Spotify password using selector: {selector}")
-                password_filled = True
-                break
-            except Exception as exc:
-                last_error = exc
-                print(f"Password selector failed: {selector} | {exc}")
-
-    if not password_filled:
-        save_debug(page, "no_password_field")
-        raise RuntimeError(
-            "Could not fill Spotify password. "
-            "Check debug/no_password_field.png. "
-            f"Last error: {last_error}"
-        )
-
-    print("Submitting Spotify login.")
-
-    click_first_working_selector(
-        page,
-        [
-            "button:has-text('Log in')",
-            "button:has-text('Log In')",
-            "button#login-button",
-            "button[data-testid='login-button']",
-            "button[type='submit']",
-        ],
-        "Spotify login button",
+    Path(SESSION_STATE_PATH).write_text(
+        json.dumps(storage_state, indent=2),
+        encoding="utf-8",
     )
 
-    page.wait_for_timeout(8000)
-
-    print(f"URL after login submit: {page.url}")
-
-    if "accounts.spotify.com" in page.url:
-        try:
-            page.wait_for_url(
-                lambda url: "accounts.spotify.com" not in url,
-                timeout=PAGE_TIMEOUT_MS,
-            )
-            print(f"Login redirected to: {page.url}")
-        except PlaywrightTimeoutError:
-            save_debug(page, "login_timeout")
-            raise RuntimeError(
-                "Spotify login did not complete. "
-                "This may be wrong credentials, captcha, email verification, or Spotify blocked GitHub. "
-                "Check debug/login_timeout.png."
-            )
-    else:
-        print(f"Login appears complete. Current URL: {page.url}")
+    print(f"Wrote storage state from Spotify cookies to {SESSION_STATE_PATH}")
+    return SESSION_STATE_PATH
 
 
-def fetch_chart_json_with_logged_in_browser() -> dict:
+def fetch_chart_json_with_browser() -> dict:
+    """
+    Opens Spotify Charts using saved Spotify cookies instead of trying to log in every time.
+    Then captures the internal Spotify chart API response.
+    """
     public_url = get_public_chart_url()
     target_substring = get_target_api_substring()
+    storage_state_path = write_storage_state_from_cookies()
 
     print(f"Public chart URL: {public_url}")
     print(f"Target API substring: {target_substring}")
@@ -411,11 +236,11 @@ def fetch_chart_json_with_logged_in_browser() -> dict:
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
             ],
         )
 
         context = browser.new_context(
+            storage_state=storage_state_path,
             viewport={"width": 1365, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -434,48 +259,42 @@ def fetch_chart_json_with_logged_in_browser() -> dict:
 
         page.on("response", log_response)
 
+        def is_target_response(response) -> bool:
+            return (
+                "charts-spotify-com-service.spotify.com" in response.url
+                and target_substring in response.url
+                and response.request.method == "GET"
+            )
+
         try:
-            login_to_spotify(page)
-
-            print("Opening chart page after login.")
-
-            def is_target_response(response) -> bool:
-                return (
-                    "charts-spotify-com-service.spotify.com" in response.url
-                    and target_substring in response.url
-                    and response.request.method == "GET"
-                )
-
             with page.expect_response(is_target_response, timeout=NETWORK_WAIT_MS) as response_info:
                 page.goto(public_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
 
             captured_response = response_info.value
 
-            status = captured_response.status
-            response_url = captured_response.url
+            print(f"Captured response URL: {captured_response.url}")
+            print(f"Captured response status: {captured_response.status}")
 
-            print(f"Captured response URL: {response_url}")
-            print(f"Captured response status: {status}")
-
-            if status >= 400:
-                body_preview = captured_response.text()[:500]
+            if captured_response.status >= 400:
                 save_debug(page, "bad_chart_response")
+                body_preview = captured_response.text()[:500]
                 raise RuntimeError(
-                    f"Captured Spotify API response returned HTTP {status}. "
-                    f"Preview: {body_preview}"
+                    f"Captured API returned HTTP {captured_response.status}. Preview: {body_preview}"
                 )
 
-            try:
-                data = captured_response.json()
-            except Exception as exc:
-                body_preview = captured_response.text()[:500]
-                save_debug(page, "invalid_json_response")
-                raise RuntimeError(
-                    f"Captured response was not valid JSON. Preview: {body_preview}"
-                ) from exc
-
+            data = captured_response.json()
             browser.close()
             return data
+
+        except PlaywrightTimeoutError:
+            save_debug(page, "no_chart_response")
+            browser.close()
+            raise RuntimeError(
+                "Could not capture chart API response. "
+                "The Spotify cookie may be missing, expired, copied from the wrong browser profile, "
+                "or not enough by itself. "
+                f"Spotify service responses seen: {service_responses_seen[:10]}"
+            )
 
         except Exception:
             save_debug(page, "failure")
@@ -582,7 +401,12 @@ def format_streams(value: str) -> str:
         return value
 
 
-def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: bool = False) -> None:
+def send_discord_update(
+    old_hash: str,
+    new_hash: str,
+    summary: dict,
+    first_run: bool = False,
+) -> None:
     webhook_url = get_discord_webhook_url()
 
     if not webhook_url:
@@ -604,21 +428,57 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
         color = 0x1DB954
 
     fields = [
-        {"name": "Detected", "value": detected_time, "inline": False},
-        {"name": "Chart", "value": summary.get("title") or "Unknown", "inline": True},
-        {"name": "Chart date", "value": summary.get("chart_date") or "Unknown", "inline": True},
+        {
+            "name": "Detected",
+            "value": detected_time,
+            "inline": False,
+        },
+        {
+            "name": "Chart",
+            "value": summary.get("title") or "Unknown",
+            "inline": True,
+        },
+        {
+            "name": "Chart date",
+            "value": summary.get("chart_date") or "Unknown",
+            "inline": True,
+        },
     ]
 
     if summary.get("top_entry"):
-        fields.append({"name": "#1 entry", "value": summary["top_entry"], "inline": False})
+        fields.append(
+            {
+                "name": "#1 entry",
+                "value": summary["top_entry"],
+                "inline": False,
+            }
+        )
 
     if summary.get("top_streams"):
-        fields.append({"name": "#1 streams", "value": format_streams(summary["top_streams"]), "inline": True})
+        fields.append(
+            {
+                "name": "#1 streams",
+                "value": format_streams(summary["top_streams"]),
+                "inline": True,
+            }
+        )
 
     if summary.get("entry_count"):
-        fields.append({"name": "Entries found", "value": summary["entry_count"], "inline": True})
+        fields.append(
+            {
+                "name": "Entries found",
+                "value": summary["entry_count"],
+                "inline": True,
+            }
+        )
 
-    fields.append({"name": "Hash", "value": f"`{old_hash[:10] or 'none'}` → `{new_hash[:10]}`", "inline": False})
+    fields.append(
+        {
+            "name": "Hash",
+            "value": f"`{old_hash[:10] or 'none'}` → `{new_hash[:10]}`",
+            "inline": False,
+        }
+    )
 
     payload = {
         "content": "@everyone" if os.getenv("DISCORD_PING_EVERYONE", "false").lower() == "true" else "",
@@ -629,12 +489,18 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
                 "url": public_chart_url,
                 "color": color,
                 "fields": fields,
-                "footer": {"text": "Spotify Chart Monitor"},
+                "footer": {
+                    "text": "Spotify Chart Monitor"
+                },
             }
         ],
     }
 
-    response = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+    response = requests.post(
+        webhook_url,
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
 
     print(f"Discord status: {response.status_code}")
 
@@ -645,7 +511,7 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
 def check_once() -> bool:
     state = load_state()
 
-    data = fetch_chart_json_with_logged_in_browser()
+    data = fetch_chart_json_with_browser()
 
     normalized = normalize_for_hash(data)
     new_hash = sha256_text(normalized)
@@ -673,7 +539,12 @@ def check_once() -> bool:
         notify_first_run = os.getenv("NOTIFY_ON_FIRST_RUN", "false").lower() == "true"
 
         if notify_first_run:
-            send_discord_update("", new_hash, summary, first_run=True)
+            send_discord_update(
+                old_hash="",
+                new_hash=new_hash,
+                summary=summary,
+                first_run=True,
+            )
 
         return True
 
@@ -685,7 +556,12 @@ def check_once() -> bool:
 
     # Send Discord before saving the new hash.
     # If Discord fails, the next run retries instead of silently missing the alert.
-    send_discord_update(old_hash, new_hash, summary, first_run=False)
+    send_discord_update(
+        old_hash=old_hash,
+        new_hash=new_hash,
+        summary=summary,
+        first_run=False,
+    )
 
     state["last_hash"] = new_hash
     state["last_seen_chart_date"] = summary.get("chart_date", "")
