@@ -2,29 +2,109 @@ name: Spotify Chart Monitor
 
 on:
   schedule:
-    # Starter attempts during a broad UTC window.
-    # Python decides whether to actually monitor based on Eastern time.
-    - cron: "7,22,37,52 10-21 * * *"
+    # GitHub cron is only a starter attempt.
+    # This tries every 5 minutes from 11:02 UTC through 21:57 UTC.
+    # In summer Eastern time, that is about 7:02 AM through 5:57 PM.
+    # Python still controls the real 9 AM–4 PM Eastern monitor window.
+    - cron: "2-59/5 11-21 * * *"
 
   workflow_dispatch:
 
 permissions:
   contents: write
-
-concurrency:
-  group: spotify-chart-monitor
-  cancel-in-progress: false
+  actions: read
 
 jobs:
-  check:
+  session_1:
+    name: Monitor Session 1
     runs-on: ubuntu-latest
     timeout-minutes: 355
+
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+
+    steps:
+      - name: Decide whether this starter should monitor
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_FILE: spotify-monitor.yml
+        run: |
+          set -euo pipefail
+
+          echo "Current run ID: ${GITHUB_RUN_ID}"
+          echo "Checking for older in-progress Spotify monitor runs..."
+
+          response="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?status=in_progress&per_page=50")"
+
+          older_count="$(echo "$response" | jq --argjson current "${GITHUB_RUN_ID}" '[.workflow_runs[] | select(.id < $current)] | length')"
+
+          echo "Older in-progress runs found: ${older_count}"
+
+          if [[ "${older_count}" -gt 0 ]]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Another older monitor run is already active. This starter will exit."
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "No older active monitor run found. This run will monitor."
+          fi
+
+      - name: Check out repository
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+
+      - name: Set up Python
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        if: steps.gate.outputs.should_run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run Spotify monitor session 1
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NOTIFY_ON_FIRST_RUN: "false"
+          DISCORD_PING_EVERYONE: "false"
+
+          # 19,800 seconds = 5.5 hours.
+          # Keeps this job below GitHub's 6-hour job limit.
+          MAX_SESSION_SECONDS: "19800"
+
+        run: python scripts/check_spotify.py
+
+      - name: Commit updated state from session 1
+        if: steps.gate.outputs.should_run == 'true' && success()
+        run: |
+          git config user.name "spotify-chart-monitor"
+          git config user.email "actions@github.com"
+
+          if [[ -n "$(git status --porcelain data/state.json)" ]]; then
+            git add data/state.json
+            git commit -m "Update Spotify monitor state"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
+
+  session_2:
+    name: Monitor Session 2
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    needs: session_1
+
+    if: needs.session_1.outputs.should_run == 'true'
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ github.token }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,18 +114,19 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Spotify monitor
+      - name: Run Spotify monitor session 2
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           NOTIFY_ON_FIRST_RUN: "false"
           DISCORD_PING_EVERYONE: "false"
 
-          # Keep each GitHub job below the 6-hour hard limit.
+          # Another 5.5-hour max session.
+          # Usually this will end naturally at 4 PM Eastern before hitting this.
           MAX_SESSION_SECONDS: "19800"
 
         run: python scripts/check_spotify.py
 
-      - name: Commit updated state
+      - name: Commit updated state from session 2
         if: success()
         run: |
           git config user.name "spotify-chart-monitor"
