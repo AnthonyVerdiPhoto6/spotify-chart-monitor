@@ -16,17 +16,24 @@ STATE_PATH = "data/state.json"
 MONITOR_URL = "https://kworb.net/spotify/country/global_daily.html"
 PUBLIC_CHART_URL = "https://charts.spotify.com/charts/view/regional-global-daily/latest"
 
+# Main monitoring window: 9:00 AM–4:00 PM Eastern
 ACTIVE_START_HOUR = 9
 ACTIVE_START_MINUTE = 0
-ACTIVE_END_HOUR = 23
-ACTIVE_END_MINUTE = 59
+ACTIVE_END_HOUR = 16
+ACTIVE_END_MINUTE = 0
 
+# Peak window: check every 1 minute
 PEAK_START_HOUR = 9
 PEAK_START_MINUTE = 45
 PEAK_END_HOUR = 10
 PEAK_END_MINUTE = 30
 
+NORMAL_CHECK_INTERVAL_SECONDS = 300
 CHECK_INTERVAL_SECONDS_DURING_PEAK = 60
+
+# GitHub-hosted jobs have a hard 6-hour limit.
+# 19,800 seconds = 5.5 hours, leaving buffer.
+MAX_SESSION_SECONDS = int(os.getenv("MAX_SESSION_SECONDS", "19800"))
 
 REQUEST_TIMEOUT_SECONDS = 25
 REQUEST_RETRIES = 3
@@ -48,48 +55,81 @@ def iso_utc() -> str:
 def readable_eastern_time() -> str:
     return now_eastern().strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
-def is_active_window(dt: datetime | None = None) -> bool:
-    """
-    Active monitoring window: 9:00 AM to 4:00 PM Eastern.
 
-    Uses < end time, so monitoring stops after the 3:55 PM run.
-    """
+def active_start_today(dt: datetime | None = None) -> datetime:
     if dt is None:
         dt = now_eastern()
 
-    start = dt.replace(
+    return dt.replace(
         hour=ACTIVE_START_HOUR,
         minute=ACTIVE_START_MINUTE,
         second=0,
         microsecond=0,
     )
 
-    end = dt.replace(
+
+def active_end_today(dt: datetime | None = None) -> datetime:
+    if dt is None:
+        dt = now_eastern()
+
+    return dt.replace(
         hour=ACTIVE_END_HOUR,
         minute=ACTIVE_END_MINUTE,
         second=0,
         microsecond=0,
     )
 
-    return start <= dt < end
 
-
-def is_peak_window(dt: datetime | None = None) -> bool:
+def is_active_window(dt: datetime | None = None) -> bool:
+    """
+    Active monitoring window: 9:00 AM to 4:00 PM Eastern.
+    Uses < end time, so monitoring stops at 4:00 PM.
+    """
     if dt is None:
         dt = now_eastern()
 
-    start = dt.replace(hour=PEAK_START_HOUR, minute=PEAK_START_MINUTE, second=0, microsecond=0)
-    end = dt.replace(hour=PEAK_END_HOUR, minute=PEAK_END_MINUTE, second=0, microsecond=0)
+    return active_start_today(dt) <= dt < active_end_today(dt)
+
+
+def is_peak_window(dt: datetime | None = None) -> bool:
+    """
+    Peak monitoring window: 9:45 AM to 10:30 AM Eastern.
+    During this time, the script checks every 60 seconds.
+    """
+    if dt is None:
+        dt = now_eastern()
+
+    start = dt.replace(
+        hour=PEAK_START_HOUR,
+        minute=PEAK_START_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+    end = dt.replace(
+        hour=PEAK_END_HOUR,
+        minute=PEAK_END_MINUTE,
+        second=0,
+        microsecond=0,
+    )
 
     return start <= dt <= end
 
 
-def should_keep_looping_this_run(start_time: datetime) -> bool:
-    if not is_peak_window():
-        return False
+def seconds_until(target_dt: datetime) -> int:
+    return max(0, int((target_dt - now_eastern()).total_seconds()))
 
-    elapsed_seconds = (now_utc() - start_time).total_seconds()
-    return elapsed_seconds < 260
+
+def session_time_remaining(start_time_utc: datetime) -> int:
+    elapsed = int((now_utc() - start_time_utc).total_seconds())
+    return max(0, MAX_SESSION_SECONDS - elapsed)
+
+
+def current_check_interval_seconds() -> int:
+    if is_peak_window():
+        return CHECK_INTERVAL_SECONDS_DURING_PEAK
+
+    return NORMAL_CHECK_INTERVAL_SECONDS
 
 
 def get_discord_webhook_url() -> str:
@@ -163,8 +203,11 @@ def fetch_page() -> str:
 
 
 def clean_for_hash(html: str) -> str:
-    # Basic normalization so harmless whitespace differences do not matter.
-    lines = [line.strip() for line in html.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    """
+    Basic normalization so harmless whitespace differences do not matter.
+    """
+    lines = html.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = [line.strip() for line in lines]
     lines = [line for line in lines if line]
     return "\n".join(lines)
 
@@ -179,16 +222,13 @@ def extract_basic_summary(html: str) -> dict:
         "top_line": "",
     }
 
-    # Light parsing without extra dependencies.
-    # Kworb rows contain artist/song text in the HTML, but exact tags can change.
-    # This keeps the monitor robust even if parsing is imperfect.
     lowered = html.lower()
 
     if "spotify daily chart - global" in lowered:
         summary["title"] = "Spotify Daily Chart - Global"
 
-    # Try to grab visible title-ish first meaningful lines.
     cleaned = clean_for_hash(html)
+
     for line in cleaned.split("\n"):
         if " - " in line and "<" not in line and len(line) < 160:
             summary["top_line"] = line
@@ -197,12 +237,18 @@ def extract_basic_summary(html: str) -> dict:
     return summary
 
 
-def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: bool = False) -> None:
+def send_discord_update(
+    old_hash: str,
+    new_hash: str,
+    summary: dict,
+    first_run: bool = False,
+) -> None:
     webhook_url = get_discord_webhook_url()
 
     if not webhook_url:
         raise RuntimeError(
-            "DISCORD_WEBHOOK_URL is not set. Not saving changed hash because no Discord alert can be sent."
+            "DISCORD_WEBHOOK_URL is not set. "
+            "Not saving changed hash because no Discord alert can be sent."
         )
 
     if first_run:
@@ -250,7 +296,9 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
     )
 
     payload = {
-        "content": "@everyone" if os.getenv("DISCORD_PING_EVERYONE", "false").lower() == "true" else "",
+        "content": "@everyone"
+        if os.getenv("DISCORD_PING_EVERYONE", "false").lower() == "true"
+        else "",
         "embeds": [
             {
                 "title": title,
@@ -259,7 +307,7 @@ def send_discord_update(old_hash: str, new_hash: str, summary: dict, first_run: 
                 "color": color,
                 "fields": fields,
                 "footer": {
-                    "text": "GitHub Spotify Monitor"
+                    "text": "GitHub Spotify Monitor",
                 },
             }
         ],
@@ -308,10 +356,16 @@ def check_once() -> bool:
 
     if new_hash == old_hash:
         print("No change detected.")
+
+        state["last_checked_at"] = iso_utc()
+        save_state(state)
+
         return True
 
     print("Change detected.")
 
+    # Send Discord before saving the new hash.
+    # If Discord fails, the next run/session retries instead of silently missing the alert.
     send_discord_update(old_hash, new_hash, summary, first_run=False)
 
     state["last_hash"] = new_hash
@@ -331,30 +385,57 @@ def main() -> int:
     print(f"Monitor URL: {MONITOR_URL}")
     print(f"Active window: {is_active_window()}")
     print(f"Peak window active: {is_peak_window()}")
+    print(f"Max session seconds: {MAX_SESSION_SECONDS}")
 
-    start_time = now_utc()
+    start_time_utc = now_utc()
 
     try:
+        # If GitHub starts the workflow before 9:00 AM Eastern,
+        # stay alive and wait until the real monitoring window begins.
+        if now_eastern() < active_start_today():
+            wait_seconds = seconds_until(active_start_today())
+            max_wait = session_time_remaining(start_time_utc)
+
+            if wait_seconds >= max_wait:
+                print("Started too early and session would expire before active window. Exiting.")
+                return 0
+
+            print(f"Started before active window. Sleeping {wait_seconds} seconds until 9:00 AM Eastern.")
+            time.sleep(wait_seconds)
+
+        # If GitHub starts after 4:00 PM Eastern, exit cleanly.
         if not is_active_window():
             print("Outside active monitoring window. No check will run.")
             return 0
 
-        if not is_peak_window():
+        print("Active monitoring session started.")
+
+        while is_active_window():
+            if session_time_remaining(start_time_utc) <= 90:
+                print("Session time nearly exhausted. Exiting so a queued/new run can take over.")
+                return 0
+
             check_once()
-            return 0
 
-        print("Peak window is active. Checking every 60 seconds during this workflow run.")
+            interval = current_check_interval_seconds()
 
-        while True:
-            check_once()
+            seconds_to_active_end = seconds_until(active_end_today())
+            seconds_left_in_session = session_time_remaining(start_time_utc)
 
-            if not should_keep_looping_this_run(start_time):
-                print("Peak loop finished for this workflow run.")
-                break
+            sleep_seconds = min(
+                interval,
+                seconds_to_active_end,
+                max(0, seconds_left_in_session - 60),
+            )
 
-            print(f"Sleeping {CHECK_INTERVAL_SECONDS_DURING_PEAK} seconds.")
-            time.sleep(CHECK_INTERVAL_SECONDS_DURING_PEAK)
+            if sleep_seconds <= 0:
+                print("No time left to sleep. Ending session.")
+                return 0
 
+            print(f"Sleeping {sleep_seconds} seconds before next check.")
+            time.sleep(sleep_seconds)
+
+        print("Active window ended. Exiting.")
         return 0
 
     except Exception as exc:
